@@ -1,0 +1,144 @@
+//package Demo.Aio;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousSocketChannel;
+import java.nio.channels.CompletionHandler;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+
+public class AioEchoClient {
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.out.println("用法: java AioEchoClient <host> <port>");
+            System.exit(1);
+        }
+        String host = args[0];
+        int portNumber = Integer.parseInt(args[1]);
+
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        try {
+            AsynchronousSocketChannel clientChannel = AsynchronousSocketChannel.open();
+            clientChannel.connect(new InetSocketAddress(host, portNumber), clientChannel,
+                    new ConnectCompletionHandler(latch));
+
+            // 等待直到用户结束（或连接失败）
+            latch.await();
+
+            try {
+                if (clientChannel.isOpen()) clientChannel.close();
+            } catch (IOException ignored) {
+            }
+        } catch (Exception e) {
+            System.out.println("客户端异常: " + e.getMessage());
+        }
+    }
+
+    private static class ConnectCompletionHandler implements CompletionHandler<Void, AsynchronousSocketChannel> {
+        private final CountDownLatch latch;
+
+        ConnectCompletionHandler(CountDownLatch latch) {
+            this.latch = latch;
+        }
+
+        @Override
+        public void completed(Void result, AsynchronousSocketChannel clientChannel) {
+            System.out.println("已连接到服务器: " + clientChannel);
+
+            // 启动一个线程，从控制台读取用户输入并异步发送
+            Thread inputThread = new Thread(() -> {
+                try (BufferedReader console = new BufferedReader(new InputStreamReader(System.in))) {
+                    String line;
+                    while ((line = console.readLine()) != null) {
+                        byte[] data = line.getBytes(StandardCharsets.UTF_8);
+                        ByteBuffer writeBuffer = ByteBuffer.wrap(data);
+                        clientChannel.write(writeBuffer, writeBuffer, new WriteCompletionHandler(clientChannel));
+                    }
+                } catch (IOException e) {
+                    System.err.println("读取控制台输入异常: " + e.getMessage());
+                } finally {
+                    latch.countDown();
+                }
+            }, "aio-client-input");
+            inputThread.setDaemon(true);
+            inputThread.start();
+        }
+
+        @Override
+        public void failed(Throwable exc, AsynchronousSocketChannel attachment) {
+            System.err.println("连接失败: " + exc.getMessage());
+            exc.printStackTrace();
+            latch.countDown();
+        }
+    }
+
+    private static class WriteCompletionHandler implements CompletionHandler<Integer, ByteBuffer> {
+        private final AsynchronousSocketChannel clientChannel;
+
+        WriteCompletionHandler(AsynchronousSocketChannel clientChannel) {
+            this.clientChannel = clientChannel;
+        }
+
+        @Override
+        public void completed(Integer bytesWritten, ByteBuffer buffer) {
+            if (buffer.hasRemaining()) {
+                clientChannel.write(buffer, buffer, this);
+                return;
+            }
+            // 写完后准备读取服务器响应
+            ByteBuffer readBuffer = ByteBuffer.allocate(1024);
+            clientChannel.read(readBuffer, readBuffer, new ReadCompletionHandler(clientChannel));
+        }
+
+        @Override
+        public void failed(Throwable exc, ByteBuffer attachment) {
+            System.err.println("写入异常: " + exc.getMessage());
+            exc.printStackTrace();
+            try {
+                clientChannel.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static class ReadCompletionHandler implements CompletionHandler<Integer, ByteBuffer> {
+        private final AsynchronousSocketChannel clientChannel;
+
+        ReadCompletionHandler(AsynchronousSocketChannel clientChannel) {
+            this.clientChannel = clientChannel;
+        }
+
+        @Override
+        public void completed(Integer bytesRead, ByteBuffer buffer) {
+            if (bytesRead == -1) {
+                try {
+                    clientChannel.close();
+                } catch (IOException ignored) {
+                }
+                return;
+            }
+            if (bytesRead > 0) {
+                buffer.flip();
+                String response = StandardCharsets.UTF_8.decode(buffer).toString();
+                System.out.println("从服务器收到响应: " + response);
+                buffer.clear();
+            }
+            // 继续读以接收后续数据
+            clientChannel.read(buffer, buffer, this);
+        }
+
+        @Override
+        public void failed(Throwable exc, ByteBuffer attachment) {
+            System.err.println("读取异常: " + exc.getMessage());
+            exc.printStackTrace();
+            try {
+                clientChannel.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+}
